@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from time import sleep
+import copy
 
 import psutil
 from sqlalchemy import Column, Integer, String, DateTime, func, Index, or_, and_
@@ -44,7 +45,7 @@ from tabulate import tabulate
 from airflow import executors, models, settings
 from airflow import configuration as conf
 from airflow.exceptions import AirflowException
-from airflow.models import DAG, DagRun
+from airflow.models import DAG, DagRun, Log
 from airflow.settings import Stats
 from airflow.task_runner import get_task_runner
 from airflow.ti_deps.dep_context import DepContext, QUEUE_DEPS, RUN_DEPS
@@ -1929,19 +1930,37 @@ class BackfillJob(BaseJob):
                                 self.logger.debug("Task Instance {} already in executor "
                                                   "waiting for queue to clear".format(ti))
                             else:
-                                self.logger.debug('Sending {} to executor'.format(ti))
-                                # Skip scheduled state, we are executing immediately
-                                ti.state = State.QUEUED
-                                session.merge(ti)
-                                executor.queue_task_instance(
-                                    ti,
-                                    mark_success=self.mark_success,
-                                    pickle_id=pickle_id,
-                                    ignore_task_deps=self.ignore_task_deps,
-                                    ignore_depends_on_past=ignore_depends_on_past,
-                                    pool=self.pool)
-                                started[key] = ti
-                                tasks_to_run.pop(key)
+
+                                task_copy = copy.copy(ti.task)
+                                context = ti.get_template_context(session)
+                                task_copy.pre_execute(context=context)
+                                if task_copy.python_callable.__name__ == "placeholder":
+                                    succeeded.add(key)
+                                    self.logger.debug("Task instance {} succeeded. "
+                                                      "Don't rerun.".format(ti))
+                                    tasks_to_run.pop(key)
+                                    if key in started:
+                                        started.pop(key)
+                                    ti.end_date = datetime.now()
+                                    ti.set_duration()
+                                    ti.state = State.SUCCESS
+                                    session.add(Log(ti.state, ti))
+                                    session.merge(ti)
+                                    session.commit()
+                                else:
+                                    self.logger.debug('Sending {} to executor'.format(ti))
+                                    # Skip scheduled state, we are executing immediately
+                                    ti.state = State.QUEUED
+                                    session.merge(ti)
+                                    executor.queue_task_instance(
+                                        ti,
+                                        mark_success=self.mark_success,
+                                        pickle_id=pickle_id,
+                                        ignore_task_deps=self.ignore_task_deps,
+                                        ignore_depends_on_past=ignore_depends_on_past,
+                                        pool=self.pool)
+                                    started[key] = ti
+                                    tasks_to_run.pop(key)
                         session.commit()
                         continue
 
